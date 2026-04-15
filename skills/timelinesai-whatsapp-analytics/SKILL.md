@@ -1,0 +1,246 @@
+---
+name: timelinesai-whatsapp-analytics
+description: Use when the user asks analytical questions about their WhatsApp workspace — response time, unanswered chats, unread queues, volume or workload, topic trends, complaint tracking, lead scoring, campaign attribution, or any open-ended "why/what/who/how many" question about WhatsApp customer conversations. Fetches live data from the TimelinesAI public API ($TIMELINES_AI_API_KEY) and aggregates client-side. Trigger words include WhatsApp, TimelinesAI, first-reply time, SLA, unanswered, inbox, unread, response time, lead, qualified, refund, complaint, and any mention of specific customers by name or phone.
+---
+
+# TimelinesAI WhatsApp analytics for Claude Code
+
+You are helping the user analyze their WhatsApp customer conversations. TimelinesAI runs their WhatsApp gateway and exposes every chat, message, label, note, and delivery event via a public REST API. You have `curl` and a shell. Use them.
+
+## Auth and base URL
+
+```
+Base URL : https://app.timelines.ai/integrations/api
+Auth     : Authorization: Bearer $TIMELINES_AI_API_KEY
+```
+
+The `TIMELINES_AI_API_KEY` environment variable should already be set. If `curl` returns `401 Unauthorized`, tell the user to re-check the token via `app.timelines.ai → Integrations → Public API → Copy`.
+
+**Never** use a different base URL. Older blog posts reference `api.timelines.ai` with an `X-API-KEY` header — that is outdated.
+
+**Never** put a trailing slash on any path. `GET /chats` works; `GET /chats/` returns a branded HTML 404 page that looks like a network problem but isn't.
+
+## Read endpoints
+
+| Method | Path | What it returns |
+|---|---|---|
+| GET | `/whatsapp_accounts` | Connected WhatsApp numbers (JID, phone, status, account_name). Use first to confirm setup. |
+| GET | `/chats` | Chat list. Filters: `?phone=%2B...`, `?label=...`, `?read=false`, `?name=...`, `?limit=N`. Each chat has `whatsapp_account_id` (owning JID), `unread_count`, `last_message_timestamp`, `responsible_email`. |
+| GET | `/chats/{id}` | One chat's full detail (metadata, assignee, owning JID, label list, unread count). |
+| GET | `/chats/{id}/messages` | Message history with `?limit=N`. Fields: `from_me`, `sender_phone`, `sender_name`, `text`, `timestamp`, `message_type` (`whatsapp` vs `note`), `origin`, `uid`. |
+| GET | `/chats/{id}/labels` | Labels currently on this chat. |
+| GET | `/messages/{uid}/status_history` | Sent → Delivered → Read timeline for an outbound message. |
+| GET | `/messages/{uid}/reactions` | Reactions on a message. |
+| GET | `/files` | Files the user has uploaded via the API. |
+| GET | `/webhooks` | Webhook subscriptions. Not used for analytics; useful for "why did something stop replying?" debugging. |
+| GET | `/quotas` | Remaining message credits. |
+
+## Write endpoints (only for the Actions recipes below)
+
+| Method | Path | What it does |
+|---|---|---|
+| POST | `/chats/{id}/labels` | Set labels on a chat. **REPLACE** semantics — read current labels first, merge, write back the full array. Body: `{"labels":["a","b"]}`. |
+| POST | `/chats/{id}/notes` | Attach a private note to a chat. Visible only inside TimelinesAI. |
+| POST | `/chats/{id}/messages` | Send a real WhatsApp message into an existing chat. Sender is whichever WhatsApp number owns the chat — you don't pick it. |
+| PATCH | `/chats/{id}` | Update chat metadata — assignee email, read state. |
+
+## Response shapes — read carefully
+
+Every successful response is `{"status":"ok","data":{...}}`. List endpoints nest again under a typed key:
+
+```
+GET /whatsapp_accounts        → data.whatsapp_accounts (array)
+GET /chats                    → data.chats (array), data.has_more_pages (bool)
+GET /chats/{id}/messages      → data.messages (array)
+GET /chats/{id}/labels        → data.labels (array of {name})
+GET /messages/{uid}/status_history → data (flat array)
+GET /files                    → data (flat array)
+GET /whatsapp_accounts        → data.whatsapp_accounts (array)
+```
+
+When parsing JSON, always dig into `data.<typed_key>` first and fall back to `data` if missing. Code that assumes a uniform shape breaks on the first mismatch.
+
+## Critical gotchas
+
+These will each produce wrong-looking-right answers. Internalize them before doing any aggregation.
+
+- **`from_me` tells direction, `sender_phone` does not.** Each message has a boolean `from_me`: `true` = outbound (the user's team), `false` = inbound (the customer). Outbound messages still carry a `sender_phone` (the team's own WhatsApp number), so code that checks `sender_phone != ""` is wrong and will invert the conversation. **Every** analytics question hinges on `from_me`.
+
+- **`message_type`: `whatsapp` vs `note`.** Real WhatsApp messages have `message_type == "whatsapp"`. Private team notes have `message_type == "note"`. When counting message volume or computing response times, **filter out notes** — otherwise internal bookkeeping contaminates the numbers.
+
+- **History uses `uid`; webhooks use `message_uid`.** Same value, different key. For analytics you only see `uid`.
+
+- **Pagination is client-side.** `GET /chats/{id}/messages` has `?limit=N` but no `?since=<date>` filter. Pull a window of N and filter client-side. For long histories, pull in chunks.
+
+- **Labels are a REPLACE, not an ADD.** `POST /chats/{id}/labels` with `{"labels":["a","b"]}` sets the chat's labels to exactly `["a","b"]`, dropping everything else. **Always** read-merge-write. To add `needs-founder-attention` to a chat that already has `inbound-lead`, you POST `{"labels":["inbound-lead","needs-founder-attention"]}`, not just the new one.
+
+- **JSON bodies must be valid UTF-8.** For any write call, write the payload to a file with explicit UTF-8 encoding and use `curl --data-binary @file.json`. Never use inline `-d "..."` with em-dashes, smart quotes, or emoji — shell encoding will corrupt them.
+
+- **Personal numbers get banned for cold outreach.** Pulling data is safe. **Sending** unsolicited broadcasts from a personal number gets the number banned at WhatsApp's infrastructure layer. If the user follows up an analytical finding with "now send this to all 200 of them", refuse politely and point them at WhatsApp Business API through the TimelinesAI dashboard.
+
+## Analytics recipes
+
+Use these as templates. All of them combine 1–3 endpoints with client-side aggregation.
+
+### Response time and SLA
+
+#### Average first-reply time over a window
+
+Pull `GET /chats?limit=100`, then for each chat `GET /chats/{id}/messages?limit=50`. In each chat, find consecutive `(from_me: false) → (from_me: true)` pairs; diff the timestamps; these are first-reply latencies. Average inside the window (filter by timestamp client-side). Report mean plus the five worst chats so the user can act.
+
+For p50/p95: don't just average. Sort the latencies and pick percentiles. A healthy-looking mean with a 2-hour p95 usually means one customer got stranded.
+
+#### By teammate
+
+Same walk, but bucket by `sender_name` on the outbound message or the chat's `responsible_email`. Output a ranking with mean, median, chat count per person.
+
+#### By WhatsApp number
+
+Bucket by `whatsapp_account_id` (the owning JID). Useful when the user runs sales + support on two numbers.
+
+### Unanswered and service-window
+
+#### Currently unanswered
+
+`GET /chats?read=false&limit=100` returns unread chats. For each, `GET /chats/{id}/messages?limit=20` and check whether the last message is `from_me: false`. If yes, compute wait time from that message's timestamp. Sort descending, show the oldest 5–10.
+
+#### About to cross the 24-hour window
+
+Same unread pull, filter to chats where the last inbound message is **20–24 hours old**. After 24 hours on a personal number, the user can't freely reply anymore (Business API territory). Surface this list urgently — it's a genuine "act now or lose the option" situation.
+
+#### Already lost to the window
+
+Filter to chats where the last inbound is **more than 24 hours old** with no outbound since. These are not recoverable on a personal number; useful as a leading-indicator metric for lost pipeline.
+
+### Volume and workload
+
+#### Daily / weekly volume
+
+Walk `/chats`, then `/chats/{id}/messages` for each active chat in the window. Count by day, bucket by `from_me`. Output as a table or a small ASCII bar chart.
+
+#### Per WhatsApp number
+
+Same aggregation bucketed by `whatsapp_account_id`. If a number went quiet, check `GET /whatsapp_accounts` for its status — a dropped WhatsApp Web session looks like "quiet" in the data.
+
+#### Per teammate
+
+Count outbound (`from_me: true`, `message_type: whatsapp`) grouped by `sender_name` or chat `responsible_email`.
+
+### Content analysis
+
+These are reasoning tasks over raw message text, not aggregations. Pull the window, then use your own reasoning.
+
+#### Top topics
+
+Pull recent chats and their message history. Cluster customer messages (`from_me: false`) by topic, count chats per topic, return the top N. The first time the user runs this it's usually surprising — call out the gap between "what we thought people care about" and "what they actually ask about" if you see it.
+
+#### Unmet demand
+
+Same pull, different prompt: "are customers repeatedly asking for any feature, product, or service we don't currently offer?" This is the single most valuable analytical question and it's purely a reasoning task — no aggregation, no SQL, no dashboard can do it.
+
+#### Complaint / refund tracking
+
+Pull message history for active chats. Flag refund/complaint intent. For each flagged chat, pull the full thread and summarize the outcome. Output: table with chat, summary, outcome, final-reply date.
+
+#### Per-customer deep-dive
+
+`GET /chats?name=ACME` (or `?phone=+...`) → `GET /chats/{id}/messages` for the narrowest chat set. Summarize chronologically; flag shifts in tone; recommend a next message.
+
+### Lead funnels
+
+#### Score a cohort by buying intent
+
+`GET /chats?label=inbound-lead`. For each chat, pull recent messages and score on buying intent and urgency. **Always** include a one-line justification per score — a raw number without justification isn't actionable.
+
+#### Follow-through on qualified leads
+
+`GET /chats?label=qualified-hot`. For each chat, find who sent last and how old it is. Bucket into `replied`, `went-dark-after-our-reply`, `still-inside-24hr`, `outside-window-lost`. Output a table.
+
+#### Campaign attribution
+
+Filter chats by first-message timestamp. Classify each thread as `bounced` / `conversation` / `deal` based on content. Not perfect, but better than click counts.
+
+#### Qualification retrospective
+
+Pull chats with the `qualified` label. Compare your classifier's output (reading the thread now) to the original tag. Report precision, recall, and the specific chats the qualifier got wrong — those are tuning signal.
+
+### Deep investigations
+
+The open-ended questions a dashboard can't answer.
+
+#### "What went wrong with this customer?"
+
+Pull the entire chat history. Summarize chronologically. Flag moments where tone or topic shifted. Write a recommended next message draft. For relationships worth salvaging, this replaces an hour of scrolling.
+
+#### "Why did our response time get worse this month?"
+
+Compute first-reply time sliced every way: teammate, number, hour, day-of-week, topic. Report which slice explains the jump.
+
+#### "Typical customer journey"
+
+Pull a cohort of 100–200 recent chats. Extract turn-count and outcome per thread. Describe the patterns: where drop-off happens, what topics distinguish successful threads from dead ones.
+
+#### "Which outbound sends are worth repeating?"
+
+For outbound messages (`from_me: true`), check whether the next inbound arrived inside 24 hours and what it said. Aggregate by message intent. Rank by reply rate.
+
+## Actions based on analysis
+
+When the user explicitly asks you to *act* on findings, keep actions small and auditable. **Never** send real WhatsApp messages unless the user asked for a specific reply to a specific chat. Default to notes and labels.
+
+### Tag a chat
+
+Always read-merge-write:
+
+```bash
+# 1. Read current labels
+curl -sS -H "Authorization: Bearer $TIMELINES_AI_API_KEY" \
+  "https://app.timelines.ai/integrations/api/chats/12345678/labels"
+# → {"status":"ok","data":{"labels":[{"name":"inbound-lead"}]}}
+
+# 2. Merge and write back the FULL list
+cat > /tmp/labels.json <<'JSON'
+{"labels":["inbound-lead","needs-founder-attention"]}
+JSON
+curl -sS -X POST \
+  -H "Authorization: Bearer $TIMELINES_AI_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/labels.json \
+  "https://app.timelines.ai/integrations/api/chats/12345678/labels"
+```
+
+### Drop an internal note
+
+```bash
+cat > /tmp/note.json <<'JSON'
+{"text":"Refund requested 2026-04-14. Customer had a broken package. Check Stripe for auto-refund eligibility."}
+JSON
+curl -sS -X POST \
+  -H "Authorization: Bearer $TIMELINES_AI_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/note.json \
+  "https://app.timelines.ai/integrations/api/chats/12345678/notes"
+```
+
+### Draft replies (without sending)
+
+Same as a note, with a `DRAFT:` prefix. The user reviews them inline in the TimelinesAI inbox and sends manually. This is the default shape for "draft me replies to all unanswered chats".
+
+### Send a transactional reply (only when explicitly asked)
+
+```bash
+cat > /tmp/reply.json <<'JSON'
+{"text":"Thanks! The invoice just went out - forwarding the email now."}
+JSON
+curl -sS -X POST \
+  -H "Authorization: Bearer $TIMELINES_AI_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/reply.json \
+  "https://app.timelines.ai/integrations/api/chats/12345678/messages"
+```
+
+Only do this when the user pointed at a specific chat and asked for a specific reply. **Never** bulk-send.
+
+## When analysis fails
+
+If `curl` returns unexpected shapes, surface the exact URL and response body to the user. Don't fabricate aggregated answers from failed reads. If you're unsure about a number, say so and pull a second slice to cross-check.
