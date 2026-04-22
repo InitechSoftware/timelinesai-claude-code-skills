@@ -686,7 +686,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--msgs-per-chat", type=int, default=200, help="Messages pulled per chat (default 200).")
     p.add_argument("--limit-chats", type=int, default=None, help="Cap on chats walked (debug).")
     p.add_argument("--limit-hits", type=int, default=500, help="Cap on result rows (default 500).")
-    p.add_argument("--concurrency", type=int, default=1, help="Parallel workers (default 1; going higher often triggers 403-under-load).")
+    p.add_argument("--concurrency", type=int, default=2, help="Parallel workers (default 2; tested safe with fresh-connection-per-request pattern).")
     p.add_argument("--cache", default=str(DEFAULT_CACHE), help="SQLite cache path (default ~/.tla-cache.sqlite).")
     p.add_argument("--no-cache", action="store_true", help="Direct API walk, no local cache.")
     p.add_argument("--refresh", action="store_true", help="Sync cache before searching.")

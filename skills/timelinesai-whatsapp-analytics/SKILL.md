@@ -92,7 +92,9 @@ and a large fraction of your context on error retries.
 
 Instead, invoke the bundled CLI in **one `Bash` tool call**. The script lives
 next to this SKILL.md, in the `scripts/` subdirectory. The exact path depends
-on where the user cloned the skill:
+on where the user cloned the skill. **Always pass `--days` on `--refresh`** —
+omitting it means a full-history sync that takes many minutes on real
+workspaces. Match the user's time phrasing, or default to `--days 180`:
 
 ```bash
 # If cloned globally via `git clone ... ~/.claude/skills/timelinesai-whatsapp`
@@ -125,12 +127,19 @@ What the CLI does:
 
 **First search of a session** (no cache yet, user asks about content):
 
-1. Ask the user for scope if it's not specified: `--days` (reasonable default: 90),
-   `--number` (optional), `--label` (optional). Never run a full-history refresh
-   across every number without permission — on a 5 000-chat workspace that's
-   many minutes and a lot of bandwidth.
-2. Run with `--refresh` to sync, then search. The sync cost is paid once.
-3. Report hits by chat, with 1–2 message snippets per hit. Don't dump raw JSON —
+1. **Always pass `--days` on `--refresh`.** If the user didn't specify a time
+   window, default to `--days 180`. Match the user's phrasing when they give one
+   ("last quarter" → `--days 90`, "last month" → `--days 30`, "this year" →
+   `--days 365`). Only omit `--days` entirely if the user explicitly asks for
+   **all-time** / **full-history** analysis — that path is 5–10× slower and is
+   almost never what they mean.
+2. Pass `--number +...` when the user has named an active WhatsApp number, or
+   only has one connected. On a multi-number workspace without a clear scope,
+   ask which number before running the first sync.
+3. Run with `--refresh` to sync, then search. On a typical workspace, a 90-day
+   sync is under a minute. Tell the user you're syncing and an estimate; don't
+   just hang.
+4. Report hits by chat, with 1–2 message snippets per hit. Don't dump raw JSON —
    summarize the pattern the user actually cares about (who, when, sentiment,
    what topic).
 
@@ -165,10 +174,14 @@ user says they want the newest messages.
 - **Do not** fall back to writing your own for-loop of curl calls "just for this
   one query". If the scope is more than ~50 chats, use the CLI — the rate-limit
   handling is the whole point.
-- **Do not** omit `--days` or `--number` on the first `--refresh`. A full refresh
-  on an enterprise workspace is the user's time and quota. Ask.
-- **Do not** treat the first `--refresh` as a failure just because it takes a
-  few minutes. That is the one-time sync cost. Tell the user what's happening.
+- **Do not** omit `--days` on `--refresh`. Omitting it is a full-history sync
+  (5–15 minutes on a real workspace) and is almost never what the user asked
+  for. If the user didn't give a window, default to `--days 180`; if the query
+  names one ("last quarter", "last month"), match it. Only omit `--days` when
+  the user explicitly asks for all-time history.
+- **Do not** treat the first `--refresh` as a failure just because it takes
+  ~30–90 seconds at `--days 180`. That is the one-time sync cost. Tell the user
+  what's happening.
 
 ### When the CLI is the wrong tool
 
