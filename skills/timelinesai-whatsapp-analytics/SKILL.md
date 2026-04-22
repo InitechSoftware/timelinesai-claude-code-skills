@@ -138,9 +138,9 @@ What the CLI does:
 2. Pass `--number +...` when the user has named an active WhatsApp number, or
    only has one connected. On a multi-number workspace without a clear scope,
    ask which number before running the first sync.
-3. Run with `--refresh` to sync, then search. On a typical workspace, a 90-day
-   sync is under a minute. Tell the user you're syncing and an estimate; don't
-   just hang.
+3. Run with `--refresh` to sync, then search. Expect roughly one minute per
+   250 in-scope chats (TL API is rate-limited, first sync is the slow step).
+   Tell the user what's happening and give a rough estimate — don't just hang.
 4. Report hits by chat, with 1–2 message snippets per hit. Don't dump raw JSON —
    summarize the pattern the user actually cares about (who, when, sentiment,
    what topic).
@@ -182,8 +182,10 @@ user says they want the newest messages.
   names one ("last quarter", "last month"), match it. Only omit `--days` when
   the user explicitly asks for all-time history.
 - **Do not** treat the first `--refresh` as a failure just because it takes
-  ~30–90 seconds at `--days 180`. That is the one-time sync cost. Tell the user
-  what's happening.
+  several minutes. TL API is rate-limited at ~2 rps per workspace; on a
+  workspace with a few hundred active chats the first sync is a few minutes,
+  and every subsequent keyword query against the cache is sub-second. Tell
+  the user what's happening.
 
 ### When the CLI is the wrong tool
 

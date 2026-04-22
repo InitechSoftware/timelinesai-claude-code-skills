@@ -310,13 +310,21 @@ def parse_ts(s: str | None) -> datetime | None:
             return None
 
 
-def walk_chats(client: Client, log: callable) -> list[dict]:
-    """Paginate /chats fully. Returns list of chat dicts."""
+def walk_chats(client: Client, log: callable, phone: str | None = None) -> list[dict]:
+    """Paginate /chats fully. Returns list of chat dicts.
+
+    If `phone` is provided, passes it as the `?phone=` server-side filter
+    so we don't page through the entire workspace just to client-side
+    filter down to one number.
+    """
     all_chats: list[dict] = []
     page = 1
     t0 = time.time()
+    base_params: dict = {}
+    if phone:
+        base_params["phone"] = phone
     while True:
-        d = client.get("/chats", params={"page": page})
+        d = client.get("/chats", params={**base_params, "page": page})
         chats = d.get("data", {}).get("chats", [])
         all_chats.extend(chats)
         more = d.get("data", {}).get("has_more_pages")
@@ -354,6 +362,9 @@ def sync(
     force_full: bool = False,
 ) -> dict:
     """Refresh the cache. Returns stats dict."""
+    # NOTE: the /chats ?phone= filter matches customer (other-party) number,
+    # NOT the owning WhatsApp account JID. So we can't use it to narrow to
+    # a single connected number — always full walk + client-side filter.
     chats = walk_chats(client, log)
     log(f"  chat list: {len(chats)} total")
 
@@ -686,7 +697,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--msgs-per-chat", type=int, default=200, help="Messages pulled per chat (default 200).")
     p.add_argument("--limit-chats", type=int, default=None, help="Cap on chats walked (debug).")
     p.add_argument("--limit-hits", type=int, default=500, help="Cap on result rows (default 500).")
-    p.add_argument("--concurrency", type=int, default=2, help="Parallel workers (default 2; tested safe with fresh-connection-per-request pattern).")
+    p.add_argument("--concurrency", type=int, default=2, help="Parallel workers (default 2; empirically the fastest on real workspaces — TL API rate-limits hard above ~2 rps).")
+    p.add_argument("--rps", type=float, default=0.0, help="Optional global request-per-second cap (default 0 = rely on TLS-handshake pacing + retry on 429). Set e.g. --rps 2 to proactively pace.")
     p.add_argument("--cache", default=str(DEFAULT_CACHE), help="SQLite cache path (default ~/.tla-cache.sqlite).")
     p.add_argument("--no-cache", action="store_true", help="Direct API walk, no local cache.")
     p.add_argument("--refresh", action="store_true", help="Sync cache before searching.")
@@ -705,7 +717,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             print(msg, file=sys.stderr, flush=True)
 
-    client = Client(token, verbose=args.verbose)
+    min_interval = 1.0 / args.rps if args.rps and args.rps > 0 else 0.0
+    client = Client(token, verbose=args.verbose, min_interval=min_interval)
 
     if args.no_cache:
         if not args.query:
