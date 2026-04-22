@@ -72,11 +72,113 @@ These will each produce wrong-looking-right answers. Internalize them before doi
 
 - **Pagination is client-side.** `GET /chats/{id}/messages` has `?limit=N` but no `?since=<date>` filter. Pull a window of N and filter client-side. For long histories, pull in chunks.
 
+- **Under load, `403 Forbidden` is a rate-limit, not a permission error.** The first request with a good token always succeeds. If subsequent calls to `/chats/{id}/messages` return `403` during a fan-out walk, that's the backend throttling, not a scope problem. Pause 2–10 seconds and retry. The only real permission case is `403` on the very first request — then the token is wrong. The bundled `scripts/tla_search.py` already handles this; if you're hand-rolling curl, keep concurrency ≤ 2 and honor `Retry-After`.
+
 - **Labels are a REPLACE, not an ADD.** `POST /chats/{id}/labels` with `{"labels":["a","b"]}` sets the chat's labels to exactly `["a","b"]`, dropping everything else. **Always** read-merge-write. To add `needs-founder-attention` to a chat that already has `inbound-lead`, you POST `{"labels":["inbound-lead","needs-founder-attention"]}`, not just the new one.
 
 - **JSON bodies must be valid UTF-8.** For any write call, write the payload to a file with explicit UTF-8 encoding and use `curl --data-binary @file.json`. Never use inline `-d "..."` with em-dashes, smart quotes, or emoji — shell encoding will corrupt them.
 
 - **Personal numbers get banned for cold outreach.** Pulling data is safe. **Sending** unsolicited broadcasts from a personal number gets the number banned at WhatsApp's infrastructure layer. If the user follows up an analytical finding with "now send this to all 200 of them", refuse politely and point them at WhatsApp Business API through the TimelinesAI dashboard.
+
+## Content search — use the bundled CLI, never walk from tool calls
+
+If the user's question requires **text search across many chats** — phrases like
+"find chats mentioning X", "which customers talked about Y", "search for the
+refund requests", "show threads where a competitor came up" — do **not** paginate
+`/chats` and fan out `GET /chats/{id}/messages` from individual tool calls. A
+single workspace has thousands of chats and the API rate-limits at ~20 req/s;
+running that walk one-tool-call-at-a-time blows tens of minutes of wall-clock
+and a large fraction of your context on error retries.
+
+Instead, invoke the bundled CLI in **one `Bash` tool call**. The script lives
+next to this SKILL.md, in the `scripts/` subdirectory. The exact path depends
+on where the user cloned the skill:
+
+```bash
+# If cloned globally via `git clone ... ~/.claude/skills/timelinesai-whatsapp`
+python ~/.claude/skills/timelinesai-whatsapp/skills/timelinesai-whatsapp-analytics/scripts/tla_search.py \
+  "claude mcp, conversational intelligence" \
+  --days 90 --number +447700182613 --refresh
+
+# If workspace-scoped install at .claude/skills/timelinesai-whatsapp
+python .claude/skills/timelinesai-whatsapp/skills/timelinesai-whatsapp-analytics/scripts/tla_search.py \
+  "claude mcp, conversational intelligence" --days 90 --refresh
+```
+
+If neither path exists, try `find ~/.claude -name tla_search.py -maxdepth 6` or
+`find . -name tla_search.py -maxdepth 6` to locate it. Always invoke with
+`python` explicitly — the script has a POSIX shebang that Windows sometimes
+ignores.
+
+What the CLI does:
+
+- Walks `/chats` (paginated) and `/chats/{id}/messages` sequentially with
+  `concurrency=2`, honoring 429/`Retry-After` and treating 403-under-load as a
+  rate-limit (retries with backoff).
+- Writes to a local SQLite + FTS5 cache at `~/.tla-cache.sqlite`. Subsequent
+  searches against the cache are milliseconds. The cache refreshes incrementally
+  on later `--refresh` runs (only chats with newer `last_message_timestamp` are
+  re-fetched).
+- Returns a JSON object with `hits` grouped by chat plus `stats` for the run.
+
+### How to use it
+
+**First search of a session** (no cache yet, user asks about content):
+
+1. Ask the user for scope if it's not specified: `--days` (reasonable default: 90),
+   `--number` (optional), `--label` (optional). Never run a full-history refresh
+   across every number without permission — on a 5 000-chat workspace that's
+   many minutes and a lot of bandwidth.
+2. Run with `--refresh` to sync, then search. The sync cost is paid once.
+3. Report hits by chat, with 1–2 message snippets per hit. Don't dump raw JSON —
+   summarize the pattern the user actually cares about (who, when, sentiment,
+   what topic).
+
+**Follow-up searches in the same session**:
+
+Run without `--refresh`. The cache is already warm; results are instant. A quick
+second run with a broader query ("now search for 'pricing' too") costs nothing.
+
+**The user changed numbers or added a label filter**:
+
+Re-run without `--refresh` first — the cache covers the broader set, the new
+`--number` / `--label` flags narrow at query time. Only add `--refresh` if the
+user says they want the newest messages.
+
+### Flags reference
+
+| Flag | Purpose |
+|---|---|
+| `"term1, term2, ..."` | Comma-separated OR terms (FTS5 phrase match, case-insensitive). |
+| `--days N` | Only chats/messages within the last N days. |
+| `--number +447...` | Filter by owning WhatsApp account (phone or JID substring). |
+| `--label NAME` | Filter by chat label (exact match). |
+| `--refresh` | Sync cache before searching. |
+| `--sync-only` | Sync only (no query). Useful to warm the cache in the background. |
+| `--no-cache` | Skip the cache entirely (live walk). Only use for one-off checks. |
+| `--limit-hits N` | Cap rows in the output (default 500). |
+| `--concurrency N` | Raise carefully. Default 2 is the tested safe value. |
+| `-v` | Verbose progress on stderr. |
+
+### Anti-patterns
+
+- **Do not** fall back to writing your own for-loop of curl calls "just for this
+  one query". If the scope is more than ~50 chats, use the CLI — the rate-limit
+  handling is the whole point.
+- **Do not** omit `--days` or `--number` on the first `--refresh`. A full refresh
+  on an enterprise workspace is the user's time and quota. Ask.
+- **Do not** treat the first `--refresh` as a failure just because it takes a
+  few minutes. That is the one-time sync cost. Tell the user what's happening.
+
+### When the CLI is the wrong tool
+
+- The question is "top topics this month" or "refund tracking" — these are
+  reasoning tasks on message content, not keyword lookups. Use the recipes in
+  *Content analysis* below, on a narrower cohort pulled directly.
+- The user points at a single chat by name/phone — use `GET /chats?name=...`
+  instead of the global search. Faster and cheaper.
+
+---
 
 ## Analytics recipes
 
@@ -129,6 +231,12 @@ Count outbound (`from_me: true`, `message_type: whatsapp`) grouped by `sender_na
 ### Content analysis
 
 These are reasoning tasks over raw message text, not aggregations. Pull the window, then use your own reasoning.
+
+> If the user's query is a **keyword or phrase lookup** ("chats mentioning X",
+> "conversations where someone asked about Y"), stop and use
+> `scripts/tla_search.py` — see *Content search* above. The recipes below
+> assume you already have a narrow cohort of chats (e.g. last 7 days on one
+> number) whose full text you can reason over directly.
 
 #### Top topics
 
