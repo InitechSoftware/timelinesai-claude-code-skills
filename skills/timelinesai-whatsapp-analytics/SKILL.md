@@ -7,6 +7,8 @@ description: Use when the user asks analytical questions about their WhatsApp wo
 
 You are helping the user analyze their WhatsApp customer conversations. TimelinesAI runs their WhatsApp gateway and exposes every chat, message, label, note, and delivery event via a public REST API. You have `curl` and a shell. Use them.
 
+This skill is the operational summary — everything you need for analytics is below. If something here is missing or you need a schema detail, the canonical upstream reference is at https://timelinesai.mintlify.app/public-api-reference/overview. Do not tell the user to read it; read it yourself if needed.
+
 ## Auth and base URL
 
 ```
